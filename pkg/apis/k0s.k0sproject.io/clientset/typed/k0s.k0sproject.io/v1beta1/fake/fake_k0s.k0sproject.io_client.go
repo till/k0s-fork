@@ -1,5 +1,5 @@
 /*
-Copyright 2022 k0s authors
+Copyright k0s authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,10 +30,6 @@ type FakeK0sV1beta1 struct {
 
 func (c *FakeK0sV1beta1) ClusterConfigs(namespace string) v1beta1.ClusterConfigInterface {
 	return &FakeClusterConfigs{c, namespace}
-}
-
-func (c *FakeK0sV1beta1) ClusterConfigLists(namespace string) v1beta1.ClusterConfigListInterface {
-	return &FakeClusterConfigLists{c, namespace}
 }
 
 // RESTClient returns a RESTClient that is used to communicate

@@ -1,5 +1,5 @@
 /*
-Copyright 2022 k0s authors
+Copyright 2020 k0s authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -29,6 +30,7 @@ import (
 	workercmd "github.com/k0sproject/k0s/cmd/worker"
 	"github.com/k0sproject/k0s/internal/pkg/dir"
 	"github.com/k0sproject/k0s/internal/pkg/file"
+	k0slog "github.com/k0sproject/k0s/internal/pkg/log"
 	"github.com/k0sproject/k0s/internal/pkg/stringmap"
 	"github.com/k0sproject/k0s/internal/pkg/sysinfo"
 	"github.com/k0sproject/k0s/pkg/apis/k0s.k0sproject.io/v1beta1"
@@ -74,7 +76,7 @@ func NewControllerCmd() *cobra.Command {
 	Note: Token can be passed either as a CLI argument or as a flag`,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			logrus.SetOutput(cmd.OutOrStdout())
-			logrus.SetLevel(logrus.InfoLevel)
+			k0slog.SetInfoLevel()
 			return config.CallParentPersistentPreRun(cmd, args)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -122,10 +124,8 @@ func NewControllerCmd() *cobra.Command {
 }
 
 func (c *command) start(ctx context.Context) error {
-	pr := prober.New()
-	go pr.Run(ctx)
-	c.NodeComponents = manager.New(pr)
-	c.ClusterComponents = manager.New(pr)
+	c.NodeComponents = manager.New(prober.DefaultProber)
+	c.ClusterComponents = manager.New(prober.DefaultProber)
 
 	perfTimer := performance.NewTimer("controller-start").Buffer().Start()
 
@@ -257,7 +257,7 @@ func (c *command) start(ctx context.Context) error {
 		)
 	}
 	c.NodeComponents.Add(ctx, &status.Status{
-		Prober: pr,
+		Prober: prober.DefaultProber,
 		StatusInformation: status.K0sStatus{
 			Pid:           os.Getpid(),
 			Role:          "controller",
@@ -323,38 +323,40 @@ func (c *command) start(ctx context.Context) error {
 	}
 	defer configSource.Stop()
 
-	if !slices.Contains(c.DisableComponents, constant.APIConfigComponentName) {
+	// The CRDs are only required if the config is stored in the cluster.
+	if configSource.NeedToStoreInitialConfig() {
 		apiConfigSaver, err := controller.NewManifestsSaver("api-config", c.K0sVars.DataDir)
 		if err != nil {
 			return fmt.Errorf("failed to initialize api-config manifests saver: %w", err)
 		}
 
-		cfgReconciler, err := controller.NewClusterConfigReconciler(
-			leaderElector,
-			c.K0sVars,
-			c.ClusterComponents,
-			apiConfigSaver,
-			adminClientFactory,
-			configSource,
-		)
-		if err != nil {
-			return fmt.Errorf("failed to initialize cluster-config reconciler: %w", err)
-		}
-		c.ClusterComponents.Add(ctx, cfgReconciler)
+		c.ClusterComponents.Add(ctx, controller.NewCRD(apiConfigSaver, []string{"v1beta1"}))
 	}
 
+	cfgReconciler, err := controller.NewClusterConfigReconciler(
+		leaderElector,
+		c.K0sVars,
+		c.ClusterComponents,
+		adminClientFactory,
+		configSource,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to initialize cluster-config reconciler: %w", err)
+	}
+	c.ClusterComponents.Add(ctx, cfgReconciler)
 	if !slices.Contains(c.DisableComponents, constant.HelmComponentName) {
 		helmSaver, err := controller.NewManifestsSaver("helm", c.K0sVars.DataDir)
 		if err != nil {
 			return fmt.Errorf("failed to initialize helm manifests saver: %w", err)
 		}
-
 		c.ClusterComponents.Add(ctx, controller.NewCRD(helmSaver, []string{"helm"}))
 		c.ClusterComponents.Add(ctx, controller.NewExtensionsController(
 			helmSaver,
 			c.K0sVars,
 			adminClientFactory,
 			leaderElector,
+			// Hardcode until the config loading is fixed
+			10,
 		))
 	}
 
@@ -380,6 +382,7 @@ func (c *command) start(ctx context.Context) error {
 			c.NodeConfig,
 			leaderElector,
 			adminClientFactory,
+			net.DefaultResolver,
 		))
 	}
 
@@ -515,7 +518,6 @@ func (c *command) start(ctx context.Context) error {
 
 	if c.EnableWorker {
 		perfTimer.Checkpoint("starting-worker")
-
 		if err := c.startWorker(ctx, c.WorkerProfile); err != nil {
 			logrus.WithError(err).Error("Failed to start controller worker")
 		} else {

@@ -1,5 +1,5 @@
 /*
-Copyright 2022 k0s authors
+Copyright k0s authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,12 +20,6 @@ package v1beta2
 
 type ControlNodeExpansion interface{}
 
-type ControlNodeListExpansion interface{}
-
 type PlanExpansion interface{}
 
-type PlanListExpansion interface{}
-
 type UpdateConfigExpansion interface{}
-
-type UpdateConfigListExpansion interface{}

@@ -1,5 +1,5 @@
 /*
-Copyright 2022 k0s authors
+Copyright 2020 k0s authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -36,7 +36,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"text/template"
@@ -44,6 +43,7 @@ import (
 
 	"github.com/k0sproject/k0s/internal/pkg/file"
 	apclient "github.com/k0sproject/k0s/pkg/apis/autopilot.k0sproject.io/v1beta2/clientset"
+	"github.com/k0sproject/k0s/pkg/constant"
 	"github.com/k0sproject/k0s/pkg/kubernetes/watch"
 	extclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/typed/apiextensions/v1"
 
@@ -104,9 +104,8 @@ type FootlooseSuite struct {
 	ControllerNetworks           []string
 	WorkerNetworks               []string
 
-	/* context and cancellation */
-
-	ctxPtr atomic.Pointer[suiteCtx]
+	ctx      context.Context
+	tearDown func()
 
 	/* footloose cluster setup */
 
@@ -116,11 +115,6 @@ type FootlooseSuite struct {
 	launchDelegate launchDelegate
 
 	dataDirOpt string // Data directory option of first controller, required to fetch the cluster state
-}
-
-type suiteCtx struct {
-	ctx  context.Context
-	stop func()
 }
 
 // initializeDefaults initializes any unset configuration knobs to their defaults.
@@ -165,19 +159,23 @@ func (s *FootlooseSuite) SetupSuite() {
 
 	s.initializeDefaults()
 
-	ctx, cancel := newSuiteContext(t)
-	var cleanupTasks sync.WaitGroup
-	sctx := suiteCtx{ctx, func() {
-		cancel()
-		cleanupTasks.Wait()
-	}}
+	tornDown := errors.New("suite torn down")
 
-	if !s.ctxPtr.CompareAndSwap(nil, &sctx) {
-		s.Require().Fail("Failed to install suite context")
+	var cleanupTasks sync.WaitGroup
+	ctx, cancel := newSuiteContext(t)
+
+	t.Cleanup(func() {
+		cancel(errors.New("test cleanup"))
+		cleanupTasks.Wait()
+	})
+
+	s.ctx, s.tearDown = ctx, func() {
+		cancel(tornDown)
+		cleanupTasks.Wait()
 	}
 
 	if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
-		t.Logf("test teardown deadline: %s", deadline)
+		t.Logf("test suite deadline: %s", deadline)
 	} else {
 		t.Log("test suite has no deadline")
 	}
@@ -191,45 +189,48 @@ func (s *FootlooseSuite) SetupSuite() {
 	go func() {
 		defer cleanupTasks.Done()
 		<-ctx.Done()
+		// Record a test failure when the context has been canceled other than
+		// through the test tear down itself. This is to ensure that the test is
+		// actually marked as failed and the cluster state will be recorded.
+		if err := context.Cause(ctx); !errors.Is(err, tornDown) {
+			assert.Failf(t, "Test suite not properly torn down", "%v", err)
+		}
 
 		t.Logf("Cleaning up")
 
-		// Replace the done context with a fresh one.
-		ctx, cancel := newSuiteContext(t)
-		defer cancel()
-		if s.ctxPtr.CompareAndSwap(&sctx, &suiteCtx{ctx, cleanupTasks.Wait}) {
-			if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
-				t.Logf("Test cleanup deadline: %s", deadline)
-			} else {
-				t.Log("Test cleanup has no deadline")
-			}
-		} else {
-			t.Log("Failed to replace suite context during cleanup")
-		}
-
-		s.cleanupSuite(t)
+		// Get a fresh context for the cleanup tasks.
+		ctx, cancel := signalAwareCtx(context.Background())
+		defer cancel(nil)
+		s.cleanupSuite(t, ctx)
 	}()
 
-	// set up signal handler so we teardown on Interrupt or SIGTERM
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		signal := <-c
-		assert.Fail(t, "Signal received", "%s", signal)
-		s.TearDownSuite()
-		os.Exit(1)
-	}()
-
-	s.waitForSSH()
+	s.waitForSSH(ctx)
 
 	if s.WithLB {
 		s.startHAProxy()
 	}
 }
 
+func signalAwareCtx(parent context.Context) (context.Context, context.CancelCauseFunc) {
+	ctx, cancel := context.WithCancelCause(parent)
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		defer signal.Stop(sigs)
+		select {
+		case <-ctx.Done():
+		case sig := <-sigs:
+			cancel(fmt.Errorf("signal received: %s", sig))
+		}
+	}()
+
+	return ctx, cancel
+}
+
 // waitForSSH waits to get a SSH connection to all footloose machines defined as part of the test suite.
 // Each node is tried in parallel for ~30secs max
-func (s *FootlooseSuite) waitForSSH() {
+func (s *FootlooseSuite) waitForSSH(ctx context.Context) {
 	nodes := []string{}
 	for i := 0; i < s.ControllerCount; i++ {
 		nodes = append(nodes, s.ControllerNode(i))
@@ -243,12 +244,12 @@ func (s *FootlooseSuite) waitForSSH() {
 
 	s.T().Logf("Waiting for SSH connections to %d nodes: %v", len(nodes), nodes)
 
-	g, ctx := errgroup.WithContext(s.Context())
+	g, ctx := errgroup.WithContext(ctx)
 	for _, node := range nodes {
 		nodeName := node
 		g.Go(func() error {
 			return wait.PollUntilWithContext(ctx, 1*time.Second, func(ctx context.Context) (bool, error) {
-				ssh, err := s.SSH(nodeName)
+				ssh, err := s.SSH(ctx, nodeName)
 				if err != nil {
 					return false, nil
 				}
@@ -270,9 +271,9 @@ func (s *FootlooseSuite) waitForSSH() {
 
 // Context returns this suite's context, which should be passed to all blocking operations.
 func (s *FootlooseSuite) Context() context.Context {
-	sctx := s.ctxPtr.Load()
-	s.Require().NotNil(sctx, "No suite context installed")
-	return sctx.ctx
+	ctx := s.ctx
+	s.Require().NotNil(ctx, "No suite context installed")
+	return ctx
 }
 
 // ControllerNode gets the node name of given controller index
@@ -312,47 +313,48 @@ func (s *FootlooseSuite) Stop(machineNames []string) error {
 // TearDownSuite is called by testify at the very end of the suite's run.
 // It cancels the suite's context in order to free the suite's resources.
 func (s *FootlooseSuite) TearDownSuite() {
-	sctx := s.ctxPtr.Load()
-	s.Require().NotNil(sctx, "No suite context installed")
-	sctx.stop()
+	tearDown := s.tearDown
+	if s.NotNil(tearDown, "Failed to tear down suite") {
+		tearDown()
+	}
 }
 
 // cleanupSuite does the cleanup work, namely destroy the footloose machines.
 // Intended to be called after the suite's context has been canceled.
-func (s *FootlooseSuite) cleanupSuite(t *testing.T) {
-	ctx := s.Context()
-	var wg sync.WaitGroup
+func (s *FootlooseSuite) cleanupSuite(t *testing.T, ctx context.Context) {
 
-	tmpDir := os.TempDir()
+	if t.Failed() {
+		var wg sync.WaitGroup
+		tmpDir := os.TempDir()
 
-	if t.Failed() && s.ControllerCount > 0 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			s.dumpClusterState(t, ctx, filepath.Join(tmpDir, "cluster-state.tar"))
-		}()
-	}
-
-	machines, err := s.InspectMachines(nil)
-	if err != nil {
-		t.Logf("Failed to inspect machines: %s", err.Error())
-		machines = nil
-	}
-
-	for _, m := range machines {
-		node := m.Hostname()
-		if strings.HasPrefix(node, "lb") {
-			continue
+		if s.ControllerCount > 0 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				s.collectTroubleshootSupportBundle(ctx, t, filepath.Join(tmpDir, "support-bundle.tar.gz"))
+			}()
 		}
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			s.dumpNodeLogs(t, ctx, node, tmpDir)
-		}()
-	}
+		machines, err := s.InspectMachines(nil)
+		if err != nil {
+			t.Logf("Failed to inspect machines: %s", err.Error())
+			machines = nil
+		}
 
-	wg.Wait()
+		for _, m := range machines {
+			node := m.Hostname()
+			if strings.HasPrefix(node, "lb") {
+				continue
+			}
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				s.dumpNodeLogs(t, ctx, node, tmpDir)
+			}()
+		}
+		wg.Wait()
+	}
 
 	if keepEnvironment(t) {
 		t.Logf("footloose cluster left intact for debugging; needs to be manually cleaned up with: footloose delete --config %s", path.Join(s.clusterDir, "footloose.yaml"))
@@ -366,50 +368,41 @@ func (s *FootlooseSuite) cleanupSuite(t *testing.T) {
 	cleanupClusterDir(t, s.clusterDir)
 }
 
-func (s *FootlooseSuite) dumpClusterState(t *testing.T, ctx context.Context, filePath string) {
-	node := s.ControllerNode(0)
+func (s *FootlooseSuite) collectTroubleshootSupportBundle(ctx context.Context, t *testing.T, filePath string) {
+	dataDir := constant.DataDirDefault
+	if s.dataDirOpt != "" {
+		dataDir = s.dataDirOpt[len(dataDirOptPrefix):]
+	}
+	cmd := fmt.Sprintf("troubleshoot-k0s-inttest.sh %q", dataDir)
 
-	ssh, err := s.SSH(node)
+	node := s.ControllerNode(0)
+	ssh, err := s.SSH(ctx, node)
 	if err != nil {
-		t.Logf("Failed to ssh into node %s to dump cluster state: %s", node, err.Error())
+		t.Logf("Failed to ssh into %s to collect support bundle: %s", node, err.Error())
 		return
 	}
 	defer ssh.Disconnect()
 
-	var cmdBuf strings.Builder
-	cmdBuf.WriteString(s.K0sFullPath)
-	if s.dataDirOpt != "" {
-		cmdBuf.WriteRune(' ')
-		cmdBuf.WriteString(s.dataDirOpt)
-	}
-	cmdBuf.WriteString(` kc cluster-info dump -A --output-directory="${TMPDIR-/tmp}"/cluster-state`)
-	cmd := cmdBuf.String()
-
-	if err := ssh.Exec(ctx, cmd, SSHStreams{}); err != nil {
-		t.Logf("Failed to dump cluster state on node %s: %s", node, err.Error())
-		return
-	}
-
-	err = file.WriteAtomically(filePath, 0644, func(unbuffered io.Writer) error {
-		w := bufio.NewWriter(unbuffered)
-		err := ssh.Exec(ctx, `tar c -C "${TMPDIR-/tmp}" cluster-state`, SSHStreams{Out: w})
+	err = file.WriteAtomically(filePath, 0644, func(file io.Writer) error {
+		stdout := bufio.NewWriter(file)
+		err := ssh.Exec(ctx, cmd, SSHStreams{Out: stdout})
 		if err != nil {
 			return err
 		}
-		return w.Flush()
+		return stdout.Flush()
 	})
 	if err != nil {
-		t.Logf("Failed to dump cluster state into %s: %s", filePath, err.Error())
+		t.Logf("Failed to collect troubleshoot support bundle on %s into %s using %q: %s", node, filePath, cmd, err.Error())
 		return
 	}
 
-	t.Logf("Dumped cluster state into %s", filePath)
+	t.Logf("Collected troubleshoot support bundle on %s into %s", node, filePath)
 }
 
 func (s *FootlooseSuite) dumpNodeLogs(t *testing.T, ctx context.Context, node, dir string) {
-	ssh, err := s.SSH(node)
+	ssh, err := s.SSH(ctx, node)
 	if err != nil {
-		t.Logf("Failed to ssh into node %s to get logs: %s", node, err.Error())
+		t.Logf("Failed to ssh into %s to get logs: %s", node, err.Error())
 		return
 	}
 	defer ssh.Disconnect()
@@ -444,7 +437,7 @@ func (s *FootlooseSuite) dumpNodeLogs(t *testing.T, ctx context.Context, node, d
 		return s.launchDelegate.ReadK0sLogs(ctx, ssh, outLog.writer, errLog.writer)
 	}()
 	if err != nil {
-		t.Logf("Failed to save k0s logs from node %s: %s", node, err.Error())
+		t.Logf("Failed to collect k0s logs from %s: %s", node, err.Error())
 	}
 
 	nonEmptyPaths := make([]string, 0, 2)
@@ -462,7 +455,7 @@ func (s *FootlooseSuite) dumpNodeLogs(t *testing.T, ctx context.Context, node, d
 	}
 
 	if len(nonEmptyPaths) > 0 {
-		t.Logf("Saved k0s logs of node %s to %s", node, strings.Join(nonEmptyPaths, " and "))
+		t.Logf("Collected k0s logs from %s into %s", node, strings.Join(nonEmptyPaths, " and "))
 	}
 }
 
@@ -482,9 +475,11 @@ func keepEnvironment(t *testing.T) bool {
 	}
 }
 
+const dataDirOptPrefix = "--data-dir="
+
 func getDataDirOpt(args []string) string {
 	for _, arg := range args {
-		if strings.HasPrefix(arg, "--data-dir=") {
+		if strings.HasPrefix(arg, dataDirOptPrefix) {
 			return arg
 		}
 	}
@@ -493,7 +488,7 @@ func getDataDirOpt(args []string) string {
 
 func (s *FootlooseSuite) startHAProxy() {
 	addresses := s.getControllersIPAddresses()
-	ssh, err := s.SSH(s.LBNode())
+	ssh, err := s.SSH(s.Context(), s.LBNode())
 	s.Require().NoError(err)
 	defer ssh.Disconnect()
 	content := s.getLBConfig(addresses)
@@ -609,7 +604,7 @@ func (s *FootlooseSuite) getControllersIPAddresses() []string {
 // InitController initializes a controller
 func (s *FootlooseSuite) InitController(idx int, k0sArgs ...string) error {
 	controllerNode := s.ControllerNode(idx)
-	ssh, err := s.SSH(controllerNode)
+	ssh, err := s.SSH(s.Context(), controllerNode)
 	if err != nil {
 		return err
 	}
@@ -633,7 +628,7 @@ func (s *FootlooseSuite) GetJoinToken(role string, extraArgs ...string) (string,
 	// assume we have main on node 0 always
 	controllerNode := s.ControllerNode(0)
 	s.Contains([]string{"controller", "worker"}, role, "Bad role")
-	ssh, err := s.SSH(controllerNode)
+	ssh, err := s.SSH(s.Context(), controllerNode)
 	if err != nil {
 		return "", err
 	}
@@ -663,7 +658,7 @@ func (s *FootlooseSuite) RunWorkers(args ...string) error {
 func (s *FootlooseSuite) RunWorkersWithToken(token string, args ...string) error {
 	for i := 0; i < s.WorkerCount; i++ {
 		workerNode := s.WorkerNode(i)
-		sshWorker, err := s.SSH(workerNode)
+		sshWorker, err := s.SSH(s.Context(), workerNode)
 		if err != nil {
 			return err
 		}
@@ -678,7 +673,7 @@ func (s *FootlooseSuite) RunWorkersWithToken(token string, args ...string) error
 }
 
 // SSH establishes an SSH connection to the node
-func (s *FootlooseSuite) SSH(node string) (*SSHConnection, error) {
+func (s *FootlooseSuite) SSH(ctx context.Context, node string) (*SSHConnection, error) {
 	m, err := s.MachineForName(node)
 	if err != nil {
 		return nil, err
@@ -696,7 +691,7 @@ func (s *FootlooseSuite) SSH(node string) (*SSHConnection, error) {
 		KeyPath: s.clusterConfig.Cluster.PrivateKey,
 	}
 
-	err = ssh.Connect(s.Context())
+	err = ssh.Connect(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -724,7 +719,7 @@ func (s *FootlooseSuite) MachineForName(name string) (*cluster.Machine, error) {
 }
 
 func (s *FootlooseSuite) StopController(name string) error {
-	ssh, err := s.SSH(name)
+	ssh, err := s.SSH(s.Context(), name)
 	s.Require().NoError(err)
 	defer ssh.Disconnect()
 	s.T().Log("killing k0s")
@@ -733,28 +728,28 @@ func (s *FootlooseSuite) StopController(name string) error {
 }
 
 func (s *FootlooseSuite) StartController(name string) error {
-	ssh, err := s.SSH(name)
+	ssh, err := s.SSH(s.Context(), name)
 	s.Require().NoError(err)
 	defer ssh.Disconnect()
 	return s.launchDelegate.StartController(s.Context(), ssh)
 }
 
 func (s *FootlooseSuite) StartWorker(name string) error {
-	ssh, err := s.SSH(name)
+	ssh, err := s.SSH(s.Context(), name)
 	s.Require().NoError(err)
 	defer ssh.Disconnect()
 	return s.launchDelegate.StartWorker(s.Context(), ssh)
 }
 
 func (s *FootlooseSuite) StopWorker(name string) error {
-	ssh, err := s.SSH(name)
+	ssh, err := s.SSH(s.Context(), name)
 	s.Require().NoError(err)
 	defer ssh.Disconnect()
 	return s.launchDelegate.StopWorker(s.Context(), ssh)
 }
 
 func (s *FootlooseSuite) Reset(name string) error {
-	ssh, err := s.SSH(name)
+	ssh, err := s.SSH(s.Context(), name)
 	s.Require().NoError(err)
 	defer ssh.Disconnect()
 	resetCommand := fmt.Sprintf("%s reset --debug", s.K0sFullPath)
@@ -768,7 +763,7 @@ func (s *FootlooseSuite) GetKubeConfig(node string, k0sKubeconfigArgs ...string)
 	if err != nil {
 		return nil, err
 	}
-	ssh, err := s.SSH(node)
+	ssh, err := s.SSH(s.Context(), node)
 	if err != nil {
 		return nil, err
 	}
@@ -805,7 +800,7 @@ func (s *FootlooseSuite) CreateUserAndGetKubeClientConfig(node string, username 
 	if err != nil {
 		return nil, err
 	}
-	ssh, err := s.SSH(node)
+	ssh, err := s.SSH(s.Context(), node)
 	if err != nil {
 		return nil, err
 	}
@@ -1022,7 +1017,7 @@ func (s *FootlooseSuite) initializeFootlooseCluster() error {
 
 // Verifies that kubelet process has the address flag set
 func (s *FootlooseSuite) GetKubeletCMDLine(node string) (string, error) {
-	ssh, err := s.SSH(node)
+	ssh, err := s.SSH(s.Context(), node)
 	if err != nil {
 		return "", err
 	}
@@ -1263,19 +1258,25 @@ func cleanupClusterDir(t *testing.T, dir string) {
 	}
 }
 
-func newSuiteContext(t *testing.T) (context.Context, context.CancelFunc) {
+func newSuiteContext(t *testing.T) (context.Context, context.CancelCauseFunc) {
+	signalCtx, cancel := signalAwareCtx(context.Background())
+
 	// We need to reserve some time to conduct a proper teardown of the suite before the test timeout kicks in.
-	if deadline, hasDeadline := t.Deadline(); hasDeadline {
-		remainingTestDuration := time.Until(deadline)
-		//  Let's reserve 10% ...
-		reservedTeardownDuration := time.Duration(float64(remainingTestDuration.Milliseconds())*0.10) * time.Millisecond
-		// ... but at least 20 seconds.
-		reservedTeardownDuration = time.Duration(math.Max(float64(20*time.Second), float64(reservedTeardownDuration)))
-		// And construct the context accordingly
-		return context.WithDeadline(context.Background(), deadline.Add(-reservedTeardownDuration))
+	deadline, hasDeadline := t.Deadline()
+	if !hasDeadline {
+		return signalCtx, cancel
 	}
 
-	return context.WithCancel(context.Background())
+	remainingTestDuration := time.Until(deadline)
+	//  Let's reserve 10% ...
+	reservedTeardownDuration := time.Duration(float64(remainingTestDuration.Milliseconds())*0.10) * time.Millisecond
+	// ... but at least 20 seconds.
+	reservedTeardownDuration = time.Duration(math.Max(float64(20*time.Second), float64(reservedTeardownDuration)))
+	// Then construct the context accordingly.
+	deadlineCtx, subCancel := context.WithDeadline(signalCtx, deadline.Add(-reservedTeardownDuration))
+	_ = subCancel // Silence linter: the deadlined context is implicitly canceled when canceling the signal context
+
+	return deadlineCtx, cancel
 }
 
 // GetControllerIPAddress returns controller ip address
@@ -1296,7 +1297,7 @@ func (s *FootlooseSuite) GetExternalEtcdIPAddress() string {
 }
 
 func (s *FootlooseSuite) getIPAddress(nodeName string) string {
-	ssh, err := s.SSH(nodeName)
+	ssh, err := s.SSH(s.Context(), nodeName)
 	s.Require().NoError(err)
 	defer ssh.Disconnect()
 
@@ -1340,7 +1341,7 @@ func (s *FootlooseSuite) NetworkExists(name string) bool {
 
 // RunCommandController runs a command via SSH on a specified controller node
 func (s *FootlooseSuite) RunCommandController(idx int, command string) (string, error) {
-	ssh, err := s.SSH(s.ControllerNode(idx))
+	ssh, err := s.SSH(s.Context(), s.ControllerNode(idx))
 	s.Require().NoError(err)
 	defer ssh.Disconnect()
 
@@ -1349,7 +1350,7 @@ func (s *FootlooseSuite) RunCommandController(idx int, command string) (string, 
 
 // RunCommandWorker runs a command via SSH on a specified controller node
 func (s *FootlooseSuite) RunCommandWorker(idx int, command string) (string, error) {
-	ssh, err := s.SSH(s.WorkerNode(idx))
+	ssh, err := s.SSH(s.Context(), s.WorkerNode(idx))
 	s.Require().NoError(err)
 	defer ssh.Disconnect()
 
@@ -1358,7 +1359,7 @@ func (s *FootlooseSuite) RunCommandWorker(idx int, command string) (string, erro
 
 // GetK0sVersion returns the `k0s version` output from a specific node.
 func (s *FootlooseSuite) GetK0sVersion(node string) (string, error) {
-	ssh, err := s.SSH(node)
+	ssh, err := s.SSH(s.Context(), node)
 	if err != nil {
 		return "", err
 	}
@@ -1376,7 +1377,7 @@ func (s *FootlooseSuite) GetK0sVersion(node string) (string, error) {
 func (s *FootlooseSuite) GetMembers(idx int) map[string]string {
 	// our etcd instances doesn't listen on public IP, so test is performed by calling CLI tools over ssh
 	// which in general even makes sense, we can test tooling as well
-	sshCon, err := s.SSH(s.ControllerNode(idx))
+	sshCon, err := s.SSH(s.Context(), s.ControllerNode(idx))
 	s.Require().NoError(err)
 	defer sshCon.Disconnect()
 	output, err := sshCon.ExecWithOutput(s.Context(), "/usr/local/bin/k0s etcd member-list")
@@ -1405,7 +1406,7 @@ func lastLine(text string) string {
 func (s *FootlooseSuite) WaitForSSH(node string, timeout time.Duration, delay time.Duration) error {
 	s.T().Logf("Waiting for SSH connection to '%s'", node)
 	for start := time.Now(); time.Since(start) < timeout; {
-		if conn, err := s.SSH(node); err == nil {
+		if conn, err := s.SSH(s.Context(), node); err == nil {
 			conn.Disconnect()
 			return nil
 		}
@@ -1419,7 +1420,7 @@ func (s *FootlooseSuite) WaitForSSH(node string, timeout time.Duration, delay ti
 
 // GetUpdateServerIPAddress returns the load balancers ip address
 func (s *FootlooseSuite) GetUpdateServerIPAddress() string {
-	ssh, err := s.SSH("updateserver0")
+	ssh, err := s.SSH(s.Context(), "updateserver0")
 	s.Require().NoError(err)
 	defer ssh.Disconnect()
 
@@ -1437,4 +1438,22 @@ func (s *FootlooseSuite) AssertSomeKubeSystemPods(client *kubernetes.Clientset) 
 	}
 
 	return false
+}
+
+func (s *FootlooseSuite) IsDockerIPv6Enabled() (bool, error) {
+	cmd := exec.Command("docker", "inspect", "bridge", "--format", "\"{{ .EnableIPv6 }}\"")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("failed to run docker inspect: %w", err)
+	}
+	var dockerBridgeEnableIPv6 string
+	err = json.Unmarshal(output, &dockerBridgeEnableIPv6)
+	if err != nil {
+		return false, fmt.Errorf("failed to parse default docker bridge EnableIPv6: %w", err)
+	}
+	bridgeEnableIPv6, err := strconv.ParseBool(dockerBridgeEnableIPv6)
+	if err != nil {
+		return false, fmt.Errorf("failed to parse default docker bridge EnableIPv6: %w", err)
+	}
+	return bridgeEnableIPv6, nil
 }

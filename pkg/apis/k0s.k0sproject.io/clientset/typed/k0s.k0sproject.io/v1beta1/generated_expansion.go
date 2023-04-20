@@ -1,5 +1,5 @@
 /*
-Copyright 2022 k0s authors
+Copyright k0s authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,5 +19,3 @@ limitations under the License.
 package v1beta1
 
 type ClusterConfigExpansion interface{}
-
-type ClusterConfigListExpansion interface{}

@@ -1,5 +1,5 @@
 /*
-Copyright 2022 k0s authors
+Copyright 2021 k0s authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -80,6 +80,31 @@ func TestValidation(t *testing.T) {
 			assert.NoError(t, repo.Validate())
 		})
 
+	})
+
+	t.Run("chart_manifest_name", func(t *testing.T) {
+		chart := Chart{
+			Name:      "release",
+			ChartName: "k0s/chart",
+			TargetNS:  "default",
+		}
+
+		chart1 := Chart{
+			Name:      "release",
+			ChartName: "k0s/chart",
+			TargetNS:  "default",
+			Order:     1,
+		}
+
+		chart2 := Chart{
+			Name:      "release",
+			ChartName: "k0s/chart",
+			TargetNS:  "default",
+			Order:     2,
+		}
+		assert.Equal(t, chart.ManifestFileName(), "0_helm_extension_release.yaml")
+		assert.Equal(t, chart1.ManifestFileName(), "1_helm_extension_release.yaml")
+		assert.Equal(t, chart2.ManifestFileName(), "2_helm_extension_release.yaml")
 	})
 
 }

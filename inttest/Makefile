@@ -32,6 +32,7 @@ bin/sonobuoy: | bin
 	  --build-arg ALPINE_VERSION=$(alpine_patch_version) \
 	  --build-arg ETCD_ARCH=$(etcd_arch) \
 	  --build-arg ETCD_VERSION=$(etcd_version) \
+	  --build-arg HELM_VERSION=$(helm_version) \
 	  --build-arg KUBE_VERSION=$(kubernetes_version) \
 	  -t footloose-alpine \
 	  -f footloose-alpine/Dockerfile \
@@ -62,7 +63,7 @@ check-ctr: TIMEOUT=10m
 check-byocri: TIMEOUT=5m
 # readiness check for metric tests takes between around 5 and 6 minutes.
 check-metrics: TIMEOUT=6m
-check-metricscraper: TIMEOUT=6m
+check-metricsscraper: TIMEOUT=6m
 
 check-calico: TIMEOUT=6m
 
@@ -103,7 +104,7 @@ check-nllb: TIMEOUT=10m
 include Makefile.variables
 
 $(smoketests): K0S_PATH ?= $(realpath ../k0s)
-$(smoketests): K0S_IMAGES_BUNDLE ?= $(realpath ../airgap-image-bundle-linux-amd64.tar)
+$(smoketests): K0S_IMAGES_BUNDLE ?= $(realpath ../airgap-image-bundle-linux-$(ARCH).tar)
 $(smoketests): .footloose-alpine.stamp
 $(smoketests): TEST_PACKAGE ?= $(subst check-,,$@)
 $(smoketests):

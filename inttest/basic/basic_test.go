@@ -1,5 +1,5 @@
 /*
-Copyright 2022 k0s authors
+Copyright 2020 k0s authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package basic
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -25,9 +26,13 @@ import (
 	"github.com/k0sproject/k0s/inttest/common"
 	"github.com/k0sproject/k0s/pkg/apis/k0s.k0sproject.io/v1beta1"
 	"github.com/k0sproject/k0s/pkg/constant"
+	"github.com/k0sproject/k0s/pkg/kubernetes/watch"
 
 	certificatesv1 "k8s.io/api/certificates/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 
@@ -43,7 +48,7 @@ func (s *BasicSuite) TestK0sGetsUp() {
 	customDataDir := "/var/lib/k0s/custom-data-dir"
 
 	// Create an empty file to prove that k0s manage to rewrite a partially written file
-	ssh, err := s.SSH(s.ControllerNode(0))
+	ssh, err := s.SSH(s.Context(), s.ControllerNode(0))
 	s.Require().NoError(err)
 	defer ssh.Disconnect()
 	_, err = ssh.ExecWithOutput(s.Context(), fmt.Sprintf("mkdir -p %s/bin && touch -t 202201010000 %s/bin/kube-apiserver", customDataDir, customDataDir))
@@ -106,7 +111,7 @@ func (s *BasicSuite) TestK0sGetsUp() {
 }
 
 func (s *BasicSuite) checkCertPerms(node string) error {
-	ssh, err := s.SSH(node)
+	ssh, err := s.SSH(s.Context(), node)
 	if err != nil {
 		return err
 	}
@@ -126,7 +131,7 @@ func (s *BasicSuite) checkCertPerms(node string) error {
 
 // Verifies that kubelet process has the address flag set
 func (s *BasicSuite) verifyKubeletAddressFlag(node string) error {
-	ssh, err := s.SSH(node)
+	ssh, err := s.SSH(s.Context(), node)
 	if err != nil {
 		return err
 	}
@@ -178,7 +183,7 @@ func isCSRApproved(csr certificatesv1.CertificateSigningRequest) bool {
 
 func (s *BasicSuite) verifyContainerdDefaultConfig() {
 	var defaultConfig bytes.Buffer
-	ssh, err := s.SSH(s.WorkerNode(0))
+	ssh, err := s.SSH(s.Context(), s.WorkerNode(0))
 	if !s.NoError(err) {
 		return
 	}
@@ -208,13 +213,30 @@ func (s *BasicSuite) verifyContainerdDefaultConfig() {
 }
 
 func (s *BasicSuite) verifyCoreDNSAntiAffinity(kc *kubernetes.Clientset) {
-	opts := metav1.ListOptions{
-		LabelSelector: "k8s-app=kube-dns",
-	}
-	pods, err := kc.CoreV1().Pods("kube-system").List(s.Context(), opts)
-	s.NoError(err)
-	s.Equal(2, len(pods.Items))
-	s.NotEqual(pods.Items[0].Spec.NodeName, pods.Items[1].Spec.NodeName)
+	// Wait until both CoreDNs Pods got assigned to a node
+	pods := map[string]types.UID{}
+
+	s.NoError(watch.Pods(kc.CoreV1().Pods("kube-system")).
+		WithLabels(labels.Set{"k8s-app": "kube-dns"}).
+		WithErrorCallback(common.RetryWatchErrors(s.T().Logf)).
+		Until(s.Context(), func(pod *corev1.Pod) (bool, error) {
+			// Keep waiting if there's no node assigned yet.
+			nodeName := pod.Spec.NodeName
+			if nodeName == "" {
+				s.T().Logf("Pod %s not scheduled yet: %+v", pod.ObjectMeta.Name, pod.Status)
+				return false, nil
+			}
+
+			uid := pod.GetUID()
+			if prevUID, ok := pods[nodeName]; ok && uid != prevUID {
+				return false, errors.New("multiple CoreDNS pods scheduled on the same node")
+			}
+
+			s.T().Logf("Pod %s scheduled on %s", pod.ObjectMeta.Name, pod.Spec.NodeName)
+
+			pods[nodeName] = pod.GetUID()
+			return len(pods) > 1, nil
+		}))
 }
 
 func TestBasicSuite(t *testing.T) {

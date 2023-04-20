@@ -1,5 +1,5 @@
 /*
-Copyright 2022 k0s authors
+Copyright 2020 k0s authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -47,7 +47,7 @@ type ClusterSpec struct {
 	WorkerProfiles    WorkerProfiles         `json:"workerProfiles,omitempty"`
 	Telemetry         *ClusterTelemetry      `json:"telemetry"`
 	Install           *InstallSpec           `json:"installConfig,omitempty"`
-	Images            *ClusterImages         `json:"images"`
+	Images            *ClusterImages         `json:"images,omitempty"`
 	Extensions        *ClusterExtensions     `json:"extensions,omitempty"`
 	Konnectivity      *KonnectivitySpec      `json:"konnectivity,omitempty"`
 	FeatureGates      FeatureGates           `json:"featureGates,omitempty"`
@@ -147,8 +147,6 @@ var _ Validateable = (*SchedulerSpec)(nil)
 func (*SchedulerSpec) Validate() []error { return nil }
 
 // +kubebuilder:object:root=true
-// +genclient
-// +genclient:onlyVerbs=create
 // ClusterConfigList contains a list of ClusterConfig
 type ClusterConfigList struct {
 	metav1.TypeMeta `json:",inline"`

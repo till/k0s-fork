@@ -1,5 +1,5 @@
 /*
-Copyright 2022 k0s authors
+Copyright 2020 k0s authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -175,7 +175,6 @@ func (hc *Commands) locateChart(name string, version string) (string, error) {
 		RepositoryConfig: hc.repoFile,
 		RepositoryCache:  hc.helmCacheDir,
 	}
-	//if c.Verify {
 
 	if err := dir.Init(hc.helmCacheDir, constant.DataDirMode); err != nil {
 		return "", fmt.Errorf("can't locate chart `%s-%s`: %v", name, version, err)
